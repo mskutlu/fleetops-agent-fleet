@@ -187,17 +187,27 @@ class Gateway:
     def guard(self, caller: str, fn):
         """Wrap an agent tool with the pre-call Armor check."""
 
+        def _clip(v):  # keep numbers intact; clip long strings (trace-safe)
+            return v if isinstance(v, (int, float)) else str(v)[:200]
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            args_repr = {k: _clip(v) for k, v in kwargs.items()}
             reasons = self.armor.inspect({"args": args, "kwargs": kwargs})
             if reasons:
                 self._trace(INCIDENT_ID.get(), caller, "guardrail_blocked", {
                     "tool": fn.__name__, "principal": caller,
-                    "args": {k: (v if isinstance(v, (int, float)) else str(v))[:200] for k, v in kwargs.items()},
-                    "reasons": reasons,
+                    "args": args_repr, "reasons": reasons,
                 })
                 return {"status": "blocked", "tool": fn.__name__, "reasons": reasons}
-            return fn(*args, **kwargs)
+            out = fn(*args, **kwargs)
+            # Stage 2c: successful tool calls are spans too (Stage 1a's docstring
+            # promised this; the guard is where every call funnels through).
+            self._trace(INCIDENT_ID.get(), caller, "tool_call", {
+                "tool": fn.__name__, "principal": caller,
+                "args": args_repr, "status": "ok",
+            })
+            return out
 
         self.guarded_tools[fn.__name__] = wrapper
         return wrapper
