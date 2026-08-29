@@ -34,7 +34,7 @@ from .agents import build_agents
 from .events import InMemoryPubSub
 from .memory import MemoryBank
 from .registry import Registry
-from .store import AgentCard, InMemoryFirestore, SessionDoc, TraceSpan
+from .store import InMemoryFirestore, SessionDoc, TraceSpan
 
 TOPIC = "incidents"
 
