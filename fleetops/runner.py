@@ -22,21 +22,27 @@ topic; a fresh worker resumes from persisted state — done tasks are skipped
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
+import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 
 from google.adk.runners import InMemoryRunner
 from google.genai import types
+from opentelemetry.trace import StatusCode
 
 from .agents import build_agents
 from .events import InMemoryPubSub
+from .llm import pinned_model
 from .gateway import DEFAULT_TOKEN, INCIDENT_ID, PRINCIPAL_FOR_AGENT, PolicyViolation
 from .gateway import Gateway
 from .memory import MemoryBank
+from .otel import configure as otel_configure, tracer
 from .registry import Registry
-from .store import InMemoryFirestore, SessionDoc, TraceSpan
+from .store import InMemoryFirestore, SessionDoc
 import os
 
 # Deployed topic is `fleetops-incidents` (Stage 3a); local default unchanged.
@@ -47,6 +53,9 @@ CAPABILITY_FOR_KIND = {
     "diagnose": "incident.diagnose",
     "remediate": "incident.remediate",
 }
+
+# hop steps that represent a rejection/block -> OTel span ends with ERROR status
+ERROR_STEPS = {"gateway_rejected", "dispatch_rejected", "guardrail_blocked"}
 
 
 class SimulatedCrash(RuntimeError):
@@ -90,6 +99,15 @@ class FleetOpsRunner:
         for card in self.cards:
             self.registry.publish(card)
         self.memory = MemoryBank(self.db)
+        # Stage 2c — OTel emission: every trace() call below becomes an SDK
+        # span; the exporter persists it to the `traces` collection.
+        otel_configure(self.db)
+        # Active model id on EVERY agent hop (mandatory-stack compliance is
+        # visible in the traces themselves): pinned 3.x when keyed, else mock.
+        self.model_id = pinned_model() if os.environ.get("GEMINI_API_KEY") else "mock"
+        self.agent_versions = {c.name: c.version for c in self.cards}
+        self._seq_counter = itertools.count(1)
+        self._seq_lock = threading.Lock()
         self._runners = {
             name: InMemoryRunner(agent=agent, app_name="fleetops")
             for name, agent in (("planner", self.planner), ("diagnoser", self.diagnoser), ("remediator", self.remediator))
@@ -237,6 +255,9 @@ class FleetOpsRunner:
         # Write back AFTER: memory bank + session doc, then mark done (atomic order).
         ts = _now()
         self.memory.write(agent_name, service, result, ts)
+        self.trace(incident_id, agent_name, "memory_write", {
+            "principal": f"{agent_name}:{service}", "entry": result[:300],
+        })
         fresh = ref.get().to_dict()
         if kind == "diagnose":
             fresh["findings"] = (fresh.get("findings") or []) + [result]
@@ -246,7 +267,7 @@ class FleetOpsRunner:
             if t["id"] == task_id:
                 t["status"] = "done"
         ref.set(fresh)
-        self.trace(incident_id, agent_name, f"{agent_name}_result", {"result": result})
+        self.trace(incident_id, agent_name, f"{agent_name}_result", {"task_id": task_id, "result": result})
         self.topic.publish({"type": "task.completed", "incident_id": incident_id, "task_id": task_id, "agent": agent_name})
 
         # Completion: all tasks done -> resolve + record the cross-session outcome.
@@ -256,6 +277,9 @@ class FleetOpsRunner:
                        f"findings={' | '.join(fresh.get('findings') or [])}; "
                        f"actions={' | '.join(fresh.get('actions') or [])}")
             self.memory.write("fleet", fresh["service"], outcome, _now())
+            self.trace(incident_id, "system", "memory_write", {
+                "principal": f"fleet:{fresh['service']}", "entry": outcome[:300],
+            })
             self._set_status(ref, "resolved")
             self.trace(incident_id, "system", "incident_resolved", {"subtasks": len(fresh["plan"])})
             self.topic.publish({"type": "incident.completed", "incident_id": incident_id})
@@ -263,24 +287,44 @@ class FleetOpsRunner:
     # -- shared surface -----------------------------------------------------
 
     def trace(self, incident_id: str, agent: str, step: str, detail: dict) -> None:
-        span = TraceSpan(
-            id=f"span-{uuid.uuid4().hex[:8]}",
-            incident_id=incident_id,
-            agent=agent,
-            step=step,
-            detail=detail,
-            ts=_now(),
-        )
-        self.db.collection("traces").add(span.to_doc())
+        """Emit ONE OpenTelemetry span for this hop.
+
+        Attributes carry the Stage 2c contract: principal (in `detail`, masked
+        tokens only), agent name + version, task id where applicable,
+        `model` = active model id on every hop, and the full detail payload.
+        Rejections/blocks end the span with ERROR status (+ reason). The
+        Firestore exporter persists it synchronously — the doc is present by
+        the time this returns (deterministic for make demo / tests).
+        """
+        with self._seq_lock:
+            seq = next(self._seq_counter)
+        attrs: dict = {
+            "incident_id": incident_id,
+            "agent": agent,
+            "step": step,  # doc field; span name stays "agent/step" for Cloud Trace
+            "seq": seq,
+            "model": self.model_id,
+            "span.detail_json": json.dumps(detail, sort_keys=True, default=str),
+        }
+        if version := self.agent_versions.get(agent):
+            attrs["agent.version"] = version
+        span = tracer().start_span(f"{agent}/{step}", attributes=attrs)
+        try:
+            if step in ERROR_STEPS:
+                reason = detail.get("reason") or "; ".join(detail.get("reasons") or [])
+                span.set_status(StatusCode.ERROR, str(reason)[:200])
+        finally:
+            span.end()  # SimpleSpanProcessor: exported to Firestore now
 
     def approved_agents(self) -> list[dict]:
         return [c.__dict__ for c in self.registry.list_approved()]
 
     def get_traces(self, incident_id: str | None = None) -> list[dict]:
+        """Full ordered chain (emission order — deterministic top-to-bottom)."""
         spans = [s.to_dict() for s in self.db.collection("traces").stream()]
         if incident_id:
             spans = [s for s in spans if s["incident_id"] == incident_id]
-        return sorted(spans, key=lambda s: s["ts"])
+        return sorted(spans, key=lambda s: (s.get("seq") or 0, s["ts"]))
 
     # -- internals ----------------------------------------------------------
 

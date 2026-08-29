@@ -6,7 +6,8 @@ Doc shapes (collections):
     sessions -> SessionDoc  {incident_id, status, description, service,
                              plan, findings, actions, created_at, updated_at}
                            (plan entries carry per-task status: pending|running|done)
-    traces   -> TraceSpan   {id, incident_id, agent, step, detail, ts}
+    traces   -> TraceSpan   {id, incident_id, agent, step, detail, ts,
+                             seq (Stage 2c: emission order), status (ok|error)}
     memory   -> dict        doc id "principal:topic" ->
                            {principal, topic, entries: [{ts, text}], updated_at} (memory bank)
 
@@ -63,10 +64,15 @@ class SessionDoc:
 class TraceSpan:
     id: str
     incident_id: str
-    agent: str  # system | planner | diagnoser | remediator
+    agent: str  # system | gateway | planner | diagnoser | remediator
     step: str  # incident_accepted | planner_plan | memory_read | tool_call | ...
     detail: dict
     ts: str
+    # Stage 2c — spans are emitted through the OpenTelemetry SDK; the exporter
+    # stamps these. `seq` gives a deterministic top-to-bottom chain order;
+    # `status` marks rejected/blocked hops (reason lives in `detail`).
+    seq: int = 0
+    status: str = "ok"
 
     def to_doc(self) -> dict:
         return asdict(self)
