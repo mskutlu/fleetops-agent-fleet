@@ -37,8 +37,10 @@ from .gateway import Gateway
 from .memory import MemoryBank
 from .registry import Registry
 from .store import InMemoryFirestore, SessionDoc, TraceSpan
+import os
 
-TOPIC = "incidents"
+# Deployed topic is `fleetops-incidents` (Stage 3a); local default unchanged.
+TOPIC = os.environ.get("PUBSUB_TOPIC", "incidents")
 
 # subtask kind -> capability the serving agent must register + approved for
 CAPABILITY_FOR_KIND = {
@@ -74,7 +76,7 @@ def _extract_json(text: str) -> dict | None:
 
 
 class FleetOpsRunner:
-    def __init__(self, db: InMemoryFirestore | None = None, pubsub: InMemoryPubSub | None = None):
+    def __init__(self, db=None, pubsub=None):  # real GCP clients satisfy the same contracts (fleetops/gcp.py)
         self.db = db or InMemoryFirestore()
         self.pubsub = pubsub or InMemoryPubSub()
         self.topic = self.pubsub.topic(TOPIC)

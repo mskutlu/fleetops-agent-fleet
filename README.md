@@ -143,19 +143,66 @@ publishing with them returns 403).
 | GET    | `/capabilities/{cap}`     | —       | Discovery: approved server of a capability, else 404 with reason |
 | GET    | `/traces`                 | —       | Trace spans, `?incident_id=` to filter           |
 
-## GCP deployment (Stage 3 — details pending)
+## Deploy to Google Cloud Run (Stage 3a)
 
-Target topology: Cloud Run for the control plane + worker, Pub/Sub for job
-events (the same `pop()`/ack pattern becomes a subscription pull), Firestore
-(Native mode) for agents/sessions/traces/memory. The fakes in
-`fleetops/events.py` and `fleetops/store.py` are drop-in shaped for the real
-clients; deployment config, IAM, and identities land in Stage 3.
+One command, idempotent — provisions everything and deploys:
 
-Stage 2b wiring for deploy: seed the `principals` collection (same doc shape
-the gateway seeds locally), issue real tokens to callers (the demo tokens are
-synthetic), and front Cloud Run with IAP/endpoint auth that maps to the same
-`Authorization: Bearer` contract. No new env vars are required by Stage 2b —
-`GEMINI_API_KEY` / `GEMINI_MODEL` remain the only ones.
+```bash
+gcloud auth login
+git clone https://github.com/mskutlu/fleetops-agent-fleet && cd fleetops-agent-fleet
+export GOOGLE_CLOUD_PROJECT=<project-id>     # region defaults to europe-west1
+export GEMINI_API_KEY=<key>                  # optional — without it agents run on the deterministic MockLlm
+./deploy.sh
+```
+
+What `deploy.sh` does (equivalent manual `gcloud` commands, for judges who prefer them):
+
+```bash
+gcloud services enable run.googleapis.com pubsub.googleapis.com firestore.googleapis.com cloudbuild.googleapis.com
+gcloud pubsub topics create fleetops-incidents
+gcloud pubsub subscriptions create fleetops-incidents-worker --topic=fleetops-incidents --ack-deadline=600
+gcloud firestore databases create --location=europe-west1          # skip if the project already has one
+gcloud run deploy fleetops --source . --region europe-west1 \
+  --allow-unauthenticated --no-cpu-throttling --max-instances 1 \
+  --set-env-vars "FLEETOPS_BACKEND=gcp,GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT,PUBSUB_TOPIC=fleetops-incidents,GEMINI_MODEL=gemini-3-flash,GEMINI_API_KEY=$GEMINI_API_KEY"
+gcloud run services describe fleetops --region europe-west1 --format 'value(status.url)'
+```
+
+**Topology.** Single Cloud Run service runs both the HTTP surface and the
+worker: the in-process worker **pulls** from the
+`fleetops-incidents-worker` subscription via `Topic.pop()` (pull-and-ack,
+at-least-once — same contract as the local fake). No separate push endpoint.
+This needs `--no-cpu-throttling` (CPU stays allocated between requests so the
+pull loop keeps running) and `--max-instances 1` (one worker, cheapest demo).
+
+**Backend swap.** `FLEETOPS_BACKEND=gcp` routes `fleetops/gcp.py` to real
+`google-cloud-pubsub` / `google-cloud-firestore` clients with the exact
+interfaces of the local fakes — no other code changes. Locally (default
+`FLEETOPS_BACKEND=memory`) nothing touches GCP and `make demo` stays
+offline. The gateway seeds its synthetic demo principals into the Firestore
+`principals` collection on first boot.
+
+**Verify the live URL** (`$URL` from the deploy output):
+
+```bash
+curl -s $URL/healthz
+ID=$(curl -s -X POST $URL/incidents -H 'content-type: application/json' \
+  -H 'Authorization: Bearer tok-orchestrator-a1b2' \
+  -d '{"description": "payment-service 500s and timeouts since 14:00 deploy", "service": "payment-service"}' | jq -r .id)
+watch -n2 "curl -s $URL/incidents/$ID | jq -c '{status, plan: [.plan[].status], findings, actions}'"   # -> resolved
+curl -s "$URL/traces?incident_id=$ID" | jq -r '.[] | "\(.ts) \(.agent) \(.step)"'                      # full reasoning chain
+```
+
+**Cost / teardown.** Scale-to-zero with a handful of demo incidents:
+Cloud Run + Pub/Sub + Firestore all stay inside their always-free tiers —
+effectively $0 for the hackathon window (the only real charge is
+`--no-cpu-throttling` CPU while the single instance is up, ≈ $0.09/hour idle;
+the stage rules allow stopping the service after submission:
+`gcloud run services delete fleetops --region europe-west1` — full teardown:
+delete the subscription, topic, and Firestore database too).
+
+`GEMINI_API_KEY` is set via `--set-env-vars` on the service (never committed);
+move it to Secret Manager for anything beyond the demo.
 
 ## Project layout
 
@@ -170,6 +217,7 @@ fleetops/
   tools.py     diagnoser/remediator tools (synthetic fleet state)
   events.py    Pub/Sub contract + in-memory fake (durable queue, at-least-once)
   store.py     Firestore contract, doc shapes + in-memory fake
+  gcp.py       Stage 3a: real Pub/Sub/Firestore clients behind the fake contracts
   service.py   FastAPI control plane + background worker thread
   demo.py      `make demo` harness — registry, crash-resume, memory recall,
                HTTP surface; fails loudly
