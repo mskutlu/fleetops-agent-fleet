@@ -1,12 +1,16 @@
-"""FastAPI control-plane surface (Stage 2b wraps this with gateway, identity
-and guardrails):
+"""FastAPI control-plane surface — Stage 2b puts the gateway in front:
+
+    Authorization: Bearer <principal token> is required on mutating routes:
+    POST /incidents needs the `dispatch` scope, POST /agents the `publish`
+    scope. Unknown principals get 401, out-of-scope ones 403 — every decision
+    (allow and deny) lands in the trace store as a gateway span.
 
     POST /incidents             -> 202; persists state + publishes job events,
                                    NO agent work on the request path — a
                                    background worker drains the pub/sub queue
     GET  /incidents/{id}        -> session doc (status, plan, findings, actions)
     GET  /agents                -> APPROVED agent cards only (Firestore registry)
-    POST /agents                -> publish/register an agent card
+    POST /agents                -> publish/register an agent card (publish scope)
     GET  /capabilities/{cap}    -> discovery: approved agent serving the
                                    capability, or 404 with a clear reason
     GET  /traces                -> trace spans (?incident_id= to filter)
@@ -18,9 +22,10 @@ import asyncio
 import threading
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
+from .gateway import Principal, PolicyViolation
 from .runner import FleetOpsRunner, SimulatedCrash
 from .store import AgentCard
 
@@ -46,7 +51,18 @@ class AgentPublish(BaseModel):
 
 def create_app(runner: FleetOpsRunner | None = None) -> FastAPI:
     runner = runner or FleetOpsRunner()
-    app = FastAPI(title="FleetOps Control Plane", version="0.2.0")
+    app = FastAPI(title="FleetOps Control Plane", version="0.3.0")
+
+    def _gate(action: str):
+        """Gateway dependency: authenticate + scope-check the principal."""
+
+        def dep(authorization: str = Header(default="")) -> Principal:
+            try:
+                return runner.gateway.check(authorization, action, capability=None, incident_id="-")
+            except PolicyViolation as e:
+                raise HTTPException(status_code=e.status, detail=e.reason)
+
+        return dep
 
     # One background worker drains the pub/sub queue (the off-request runtime).
     stop = threading.Event()
@@ -72,9 +88,9 @@ def create_app(runner: FleetOpsRunner | None = None) -> FastAPI:
     app.state.worker_thread = worker_thread
 
     @app.post("/incidents", status_code=202)
-    def post_incident(body: IncidentCreate) -> dict:
-        incident_id = runner.create_incident(body.description, body.service)
-        return {"id": incident_id, "status": "accepted"}
+    def post_incident(body: IncidentCreate, principal: Principal = Depends(_gate("dispatch"))) -> dict:
+        incident_id = runner.create_incident(body.description, body.service, principal_token=principal.token)
+        return {"id": incident_id, "status": "accepted", "routed_to": "planner", "principal": principal.name}
 
     @app.get("/incidents/{incident_id}")
     def get_incident(incident_id: str) -> dict:
@@ -89,10 +105,10 @@ def create_app(runner: FleetOpsRunner | None = None) -> FastAPI:
         return runner.approved_agents()
 
     @app.post("/agents", status_code=201)
-    def post_agent(body: AgentPublish) -> dict:
+    def post_agent(body: AgentPublish, principal: Principal = Depends(_gate("publish"))) -> dict:
         card = AgentCard(**body.model_dump())
         ref_id = runner.registry.publish(card)
-        return {"name": ref_id, "approval_status": card.approval_status}
+        return {"name": ref_id, "approval_status": card.approval_status, "published_by": principal.name}
 
     @app.get("/capabilities/{capability}")
     def get_capability(capability: str) -> dict[str, Any]:

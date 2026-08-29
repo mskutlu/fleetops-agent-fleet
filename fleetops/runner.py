@@ -32,6 +32,8 @@ from google.genai import types
 
 from .agents import build_agents
 from .events import InMemoryPubSub
+from .gateway import DEFAULT_TOKEN, INCIDENT_ID, PRINCIPAL_FOR_AGENT, PolicyViolation
+from .gateway import Gateway
 from .memory import MemoryBank
 from .registry import Registry
 from .store import InMemoryFirestore, SessionDoc, TraceSpan
@@ -54,6 +56,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _principal_token(agent_name: str) -> str:
+    """Demo principal token carrying this agent's hops (synthetic, seeded)."""
+    principal = PRINCIPAL_FOR_AGENT[agent_name]
+    from .gateway import _SEED_PRINCIPALS
+    return _SEED_PRINCIPALS[principal][0]
+
+
 def _extract_json(text: str) -> dict | None:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
@@ -69,7 +78,11 @@ class FleetOpsRunner:
         self.db = db or InMemoryFirestore()
         self.pubsub = pubsub or InMemoryPubSub()
         self.topic = self.pubsub.topic(TOPIC)
-        self.planner, self.diagnoser, self.remediator, self.cards = build_agents()
+        self.planner, self.diagnoser, self.remediator, self.cards = None, None, None, []
+        # Stage 2b pillars: gateway (identity + policy + Model Armor) first —
+        # agent tools are built behind its Armor guard.
+        self.gateway = Gateway(self.db, self.trace)
+        self.planner, self.diagnoser, self.remediator, self.cards = build_agents(gateway=self.gateway)
         # Stage 2a pillars: registry + memory bank (both backed by Firestore docs)
         self.registry = Registry(self.db)
         for card in self.cards:
@@ -82,9 +95,11 @@ class FleetOpsRunner:
 
     # -- request path -------------------------------------------------------
 
-    def create_incident(self, description: str, service: str) -> str:
+    def create_incident(self, description: str, service: str,
+                        principal_token: str = DEFAULT_TOKEN) -> str:
         """Accept an incident. Persists state + publishes the first job event;
-        NO agent work runs here — a Worker picks the job up from the queue."""
+        NO agent work runs here — a Worker picks the job up from the queue.
+        The gateway routes the caller's dispatch hop to the planner (traced)."""
         incident_id = f"inc-{uuid.uuid4().hex[:8]}"
         doc = SessionDoc(
             incident_id=incident_id,
@@ -96,6 +111,7 @@ class FleetOpsRunner:
         )
         self.db.collection("sessions").document(incident_id).set(doc.__dict__)
         self.trace(incident_id, "system", "incident_accepted", {"service": service, "description": description})
+        self.gateway.check(principal_token, "dispatch", "incident.plan", incident_id)
         self.topic.publish({"type": "incident.accepted", "incident_id": incident_id, "service": service})
         return incident_id
 
@@ -109,7 +125,6 @@ class FleetOpsRunner:
             await self._execute_task(data["incident_id"], data["task"]["id"])
         # else: completion notifications (task.completed / incident.completed) —
         # downstream signals; no state change here. Redeliveries are harmless.
-
     def rejection_reason(self, capability: str) -> str:
         """Clear gateway-style reason for a capability no approved agent serves."""
         reason = f"no registered+approved agent serves capability '{capability}'"
@@ -121,6 +136,14 @@ class FleetOpsRunner:
     async def _plan(self, incident_id: str) -> None:
         ref = self.db.collection("sessions").document(incident_id)
         doc = ref.get().to_dict()
+        incident = INCIDENT_ID.set(incident_id)  # armor attributes tool calls to this incident
+        try:
+            await self._plan_inner(ref, doc)
+        finally:
+            INCIDENT_ID.reset(incident)
+
+    async def _plan_inner(self, ref, doc: dict) -> None:
+        incident_id = doc["incident_id"]
         self._set_status(ref, "planning")
 
         # Memory BEFORE acting: recall this service's prior fleet outcomes.
@@ -158,6 +181,13 @@ class FleetOpsRunner:
             self.topic.publish({"type": "task.created", "incident_id": incident_id, "task": st})
 
     async def _execute_task(self, incident_id: str, task_id: str) -> None:
+        incident = INCIDENT_ID.set(incident_id)  # armor attributes tool calls to this incident
+        try:
+            await self._execute_task_inner(incident_id, task_id)
+        finally:
+            INCIDENT_ID.reset(incident)
+
+    async def _execute_task_inner(self, incident_id: str, task_id: str) -> None:
         ref = self.db.collection("sessions").document(incident_id)
         doc = ref.get().to_dict()
         task = next((t for t in doc["plan"] if t["id"] == task_id), None)
@@ -172,11 +202,12 @@ class FleetOpsRunner:
         kind = task["kind"]
         agent_name = "diagnoser" if kind == "diagnose" else "remediator"
         cap = CAPABILITY_FOR_KIND[kind]
-        # Re-check at dispatch time: the registry may have changed since planning.
-        card = self.registry.resolve(cap)
-        if card is None or card.name != agent_name:
-            reason = self.rejection_reason(cap)
-            self.trace(incident_id, agent_name, "dispatch_rejected", {"task_id": task_id, "capability": cap, "reason": reason})
+        # Gateway hop: the specialist's own principal executes — identity +
+        # policy + capability resolution in one traced decision.
+        try:
+            self.gateway.check(_principal_token(agent_name), "execute", cap, incident_id)
+        except PolicyViolation as e:
+            self.trace(incident_id, agent_name, "dispatch_rejected", {"task_id": task_id, "capability": cap, "reason": e.reason})
             self._set_status(ref, "blocked")
             return
 
