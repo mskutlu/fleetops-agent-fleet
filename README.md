@@ -4,11 +4,11 @@ FleetOps is an incident-response control plane for a fleet of Google ADK agents
 on GCP: a **Planner** decomposes an incident into subtasks, **specialist
 agents** (diagnoser, remediator) execute them with tools, and every step is
 traced, stored, and streamed as events. Built for the *Fortified Enterprise
-Fleet* track — this repo covers Stage 1a + 2a: an **agent registry**
+Fleet* track — this repo covers Stage 1a + 2a + 2b: an **agent registry**
 (publish/version/discover approved agents), an **async pub/sub runtime** with
-crash-resume, and a cross-session **memory bank**. All local and fully
-offline-capable; the gateway / identity / guardrails layers land in Stage 2b,
-deployment in Stage 3.
+crash-resume, a cross-session **memory bank**, **zero-trust agent identity**, a
+policy-enforcing **gateway**, and inline **Model Armor guardrails**. All local
+and fully offline-capable; deployment lands in Stage 3.
 
 ## Architecture
 
@@ -44,6 +44,27 @@ kill-and-resume step.
 specialist's own notes plus one fleet-level outcome per resolved incident,
 so the next session on that service recalls what happened before.
 
+**Agent identity + gateway (Stage 2b).** Every caller — external client or
+agent-to-agent hop — carries a principal token (`Authorization: Bearer …` on
+HTTP). Principals live in the Firestore `principals` collection (token →
+name/role/scopes; synthetic demo credentials only — traces log a masked
+prefix, never the token). `Gateway.check()` is the single entrypoint:
+authenticate, enforce the scope policy (**planner may `dispatch`; specialists
+may `execute` but not `publish`**), resolve the capability to a
+registered+approved agent — and record the route+decision as a trace span for
+EVERY hop (`gateway_route` allow / `gateway_rejected` deny, with reason).
+Unknown principal → 401; out-of-scope action → 403; both visible in the
+response and the trace store.
+
+**Model Armor — inline guardrails (Stage 2b).** Deterministic, cheap
+pre-tool-call inspection of tool arguments (`fleetops/gateway.py`): a call
+whose arguments carry prompt-injection markers (instruction override,
+system-prompt probing, exfiltration, tool poisoning), PII patterns (email,
+card-like numbers), or credential shapes (access keys, private keys) never
+reaches the tool — the wrapper traces `guardrail_blocked` with the matched
+reasons and returns a structured blocked result to the calling agent.
+`make demo` section 6 blocks a live injection+PII payload.
+
 **Agents (Google ADK).** Three `LlmAgent`s registered as agent cards in the
 Firestore registry (`GET /agents`, approved-only).
 
@@ -69,7 +90,8 @@ ship in-memory fakes exposing the same read/write API as the GCP clients:
   `TraceSpan`, memory-bank docs). Stage 3 swaps in `google.cloud.firestore`.
 
 **Collections:** `agents` (registry: agent cards incl. version, capabilities,
-owner dept, approval status), `sessions` (incident state; per-task
+owner dept, approval status), `principals` (identity: token → name, role,
+scopes), `sessions` (incident state; per-task
 pending/running/done for crash-resume), `traces` (trace spans), `memory`
 (memory bank keyed by principal+topic).
 
@@ -100,20 +122,26 @@ curl -s localhost:8080/agents                      # approved cards only
 curl -s localhost:8080/capabilities/incident.diagnose   # discovery -> serving agent
 curl -s -X POST localhost:8080/incidents \
   -H 'content-type: application/json' \
+  -H 'Authorization: Bearer tok-orchestrator-a1b2' \
   -d '{"description": "payment-service 500s and timeouts since 14:00 deploy", "service": "payment-service"}'
 curl -s localhost:8080/incidents/<id> && curl -s localhost:8080/traces
 ```
 
+Demo principal tokens (synthetic, seeded by the gateway): orchestrator
+`tok-orchestrator-a1b2` (dispatch+publish), diagnoser
+`tok-diagnoser-c3d4` / remediator `tok-remediator-e5f6` (execute only —
+publishing with them returns 403).
+
 ## HTTP surface
 
-| Method | Path                      | Purpose                                          |
-|--------|---------------------------|--------------------------------------------------|
-| POST   | `/incidents`              | Accept incident; jobs run off-request (202)      |
-| GET    | `/incidents/{id}`         | Session doc: status, plan, findings, actions     |
-| GET    | `/agents`                 | **Approved-only** registry cards                 |
-| POST   | `/agents`                 | Publish/register an agent card (defaults pending)|
-| GET    | `/capabilities/{cap}`     | Discovery: approved server of a capability, else 404 with reason |
-| GET    | `/traces`                 | Trace spans, `?incident_id=` to filter           |
+| Method | Path                      | Auth    | Purpose                                          |
+|--------|---------------------------|---------|--------------------------------------------------|
+| POST   | `/incidents`              | dispatch| Accept incident; jobs run off-request (202)      |
+| GET    | `/incidents/{id}`         | —       | Session doc: status, plan, findings, actions     |
+| GET    | `/agents`                 | —       | **Approved-only** registry cards                 |
+| POST   | `/agents`                 | publish | Publish/register an agent card (defaults pending)|
+| GET    | `/capabilities/{cap}`     | —       | Discovery: approved server of a capability, else 404 with reason |
+| GET    | `/traces`                 | —       | Trace spans, `?incident_id=` to filter           |
 
 ## GCP deployment (Stage 3 — details pending)
 
@@ -123,12 +151,19 @@ events (the same `pop()`/ack pattern becomes a subscription pull), Firestore
 `fleetops/events.py` and `fleetops/store.py` are drop-in shaped for the real
 clients; deployment config, IAM, and identities land in Stage 3.
 
+Stage 2b wiring for deploy: seed the `principals` collection (same doc shape
+the gateway seeds locally), issue real tokens to callers (the demo tokens are
+synthetic), and front Cloud Run with IAP/endpoint auth that maps to the same
+`Authorization: Bearer` contract. No new env vars are required by Stage 2b —
+`GEMINI_API_KEY` / `GEMINI_MODEL` remain the only ones.
+
 ## Project layout
 
 ```
 fleetops/
   agents.py    ADK LlmAgents (planner, diagnoser, remediator) + registry cards
   runner.py    orchestration: request path + worker path (plan/execute/resume)
+  gateway.py   Stage 2b: identity/principals, gateway policy+routing, Model Armor
   registry.py  agent registry: publish / list approved / resolve capability
   memory.py    memory bank: principal+topic keyed cross-session context
   llm.py       pinned Gemini 3.x when keyed, deterministic MockLlm otherwise

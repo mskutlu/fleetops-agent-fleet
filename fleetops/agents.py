@@ -35,7 +35,13 @@ def model_label() -> str:
     return pinned_model() if os.environ.get("GEMINI_API_KEY") else "mock"
 
 
-def build_agents():
+def build_agents(gateway=None):
+    """gateway (Stage 2b): when given, every tool call passes the Model Armor
+    pre-tool-call guard before reaching the real function."""
+
+    def tools_for(name: str, fns: list) -> list:
+        return [gateway.guard(name, f) for f in fns] if gateway else list(fns)
+
     planner = LlmAgent(
         name="planner",
         model=make_model("planner"),
@@ -47,14 +53,14 @@ def build_agents():
         model=make_model("diagnoser"),
         description="Diagnoses incidents using log/metric tools.",
         instruction=_DIAGNOSER_INSTRUCTION,
-        tools=[query_logs, check_metrics],
+        tools=tools_for("diagnoser", [query_logs, check_metrics]),
     )
     remediator = LlmAgent(
         name="remediator",
         model=make_model("remediator"),
         description="Remediates incidents using restart/scale tools.",
         instruction=_REMEDIATOR_INSTRUCTION,
-        tools=[restart_service, scale_service],
+        tools=tools_for("remediator", [restart_service, scale_service]),
     )
     cards = [
         AgentCard(
