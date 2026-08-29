@@ -26,6 +26,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from .gateway import Principal, PolicyViolation
+from .gcp import make_backends
 from .runner import FleetOpsRunner, SimulatedCrash
 from .store import AgentCard
 
@@ -50,7 +51,10 @@ class AgentPublish(BaseModel):
 
 
 def create_app(runner: FleetOpsRunner | None = None) -> FastAPI:
-    runner = runner or FleetOpsRunner()
+    if runner is None:
+        # Backends follow FLEETOPS_BACKEND: fakes locally, real GCP on Cloud Run.
+        db, pubsub = make_backends()
+        runner = FleetOpsRunner(db=db, pubsub=pubsub)
     app = FastAPI(title="FleetOps Control Plane", version="0.3.0")
 
     def _gate(action: str):
