@@ -4,11 +4,12 @@ FleetOps is an incident-response control plane for a fleet of Google ADK agents
 on GCP: a **Planner** decomposes an incident into subtasks, **specialist
 agents** (diagnoser, remediator) execute them with tools, and every step is
 traced, stored, and streamed as events. Built for the *Fortified Enterprise
-Fleet* track — this repo covers Stage 1a + 2a + 2b: an **agent registry**
+Fleet* track — this repo covers Stage 1a + 2a + 2b + 2c: an **agent registry**
 (publish/version/discover approved agents), an **async pub/sub runtime** with
 crash-resume, a cross-session **memory bank**, **zero-trust agent identity**, a
-policy-enforcing **gateway**, and inline **Model Armor guardrails**. All local
-and fully offline-capable; deployment lands in Stage 3.
+policy-enforcing **gateway**, inline **Model Armor guardrails**, and
+**OpenTelemetry-compliant traces + a one-page observability dashboard**. All
+local and fully offline-capable; deployment lands in Stage 3.
 
 ## Architecture
 
@@ -65,6 +66,24 @@ reaches the tool — the wrapper traces `guardrail_blocked` with the matched
 reasons and returns a structured blocked result to the calling agent.
 `make demo` section 6 blocks a live injection+PII payload.
 
+**Observability — OTel traces + dashboard (Stage 2c).** Every agent hop is
+emitted as an **OpenTelemetry span** via the opentelemetry SDK trace API:
+planner decisions, gateway route+policy (allow and deny), tool calls including
+blocked guardrail events, and memory reads/writes. Span attributes carry the
+contract: `incident_id`, `agent` (+ `agent.version`), task id where applicable,
+principal (masked token only), `model` = **active model id on every hop**
+(so the traces themselves prove the Gemini 3.x mandatory-stack pin), and the
+full detail payload; rejections/blocks end their span with ERROR status +
+reason. A `SpanExporter` (`fleetops/otel.py`) persists each ended span as ONE
+doc in the existing Firestore `traces` collection — **same query surface as
+GET /traces**, now deterministically ordered by a monotonic emission `seq`
+(the chain reads top-to-bottom). The dashboard is one server-rendered HTML page
+on the same FastAPI app (`GET /trace/{incident_id}`, no JS): timeline of hops
+with timestamps, which agent did what, memory recall events, and red-
+highlighted rejected/blocked spans with reasons. `make demo` ends by serving
+it (see below); it works against local fakes and unchanged after GCP deploy.
+New deps added: `opentelemetry-api` + `opentelemetry-sdk` only.
+
 **Agents (Google ADK).** Three `LlmAgent`s registered as agent cards in the
 Firestore registry (`GET /agents`, approved-only).
 
@@ -87,7 +106,11 @@ ship in-memory fakes exposing the same read/write API as the GCP clients:
   Stage 3 swaps in `google.cloud.pubsub_v1` with no code change elsewhere.
 - `fleetops/store.py` — Firestore: `collection().document().get()/set()`,
   `add()`, `stream()`, plus the doc shapes (`AgentCard`, `SessionDoc`,
-  `TraceSpan`, memory-bank docs). Stage 3 swaps in `google.cloud.firestore`.
+  `TraceSpan` incl. Stage 2c's `seq`/`status`, memory-bank docs). Stage 3
+  swaps in `google.cloud.firestore`.
+- `fleetops/otel.py` — Stage 2c: OTel tracer provider + the span exporter that
+  ends each span as one doc in `traces`. Pointing OTLP at Cloud Trace is
+  additive (see "OpenTelemetry → Cloud Trace" below) — no other code change.
 
 **Collections:** `agents` (registry: agent cards incl. version, capabilities,
 owner dept, approval status), `principals` (identity: token → name, role,
@@ -104,6 +127,13 @@ git clone https://github.com/mskutlu/fleetops-agent-fleet
 cd fleetops-agent-fleet
 make demo          # offline; uses the deterministic mock LLM
 ```
+
+`make demo` runs all checks (registry, crash-resume, memory recall, gateway,
+armor) and then **ends by serving the observability dashboard** — it prints the
+URL of one incident's full chain (incl. a rejection + a guardrail block, red-
+highlighted), e.g. `http://127.0.0.1:8080/trace/inc-…`. Ctrl-C stops the server;
+`NO_SERVE=1 make demo` exits right after the checks instead (CI);
+if 8080 is in use on your machine, `DEMO_PORT=8090 make demo` serves there.
 
 With Gemini (optional):
 
@@ -125,6 +155,9 @@ curl -s -X POST localhost:8080/incidents \
   -H 'Authorization: Bearer tok-orchestrator-a1b2' \
   -d '{"description": "payment-service 500s and timeouts since 14:00 deploy", "service": "payment-service"}'
 curl -s localhost:8080/incidents/<id> && curl -s localhost:8080/traces
+# Stage 2c — observability dashboard (one page, no JS):
+curl -s localhost:8080/trace/<incident-id> | less   # timeline; red = rejected/blocked
+curl -s localhost:8080/                            # index of incidents + trace links
 ```
 
 Demo principal tokens (synthetic, seeded by the gateway): orchestrator
@@ -141,7 +174,9 @@ publishing with them returns 403).
 | GET    | `/agents`                 | —       | **Approved-only** registry cards                 |
 | POST   | `/agents`                 | publish | Publish/register an agent card (defaults pending)|
 | GET    | `/capabilities/{cap}`     | —       | Discovery: approved server of a capability, else 404 with reason |
-| GET    | `/traces`                 | —       | Trace spans, `?incident_id=` to filter           |
+| GET    | `/traces`                 | —       | Full ordered trace chain (emission order), `?incident_id=` to filter |
+| GET    | `/trace/{incident_id}`    | —       | **Stage 2c: one-page observability dashboard** (HTML) for the incident's full chain |
+| GET    | `/`                       | —       | Index of known incidents with trace links        |
 
 ## Deploy to Google Cloud Run (Stage 3a)
 
@@ -204,6 +239,38 @@ delete the subscription, topic, and Firestore database too).
 `GEMINI_API_KEY` is set via `--set-env-vars` on the service (never committed);
 move it to Secret Manager for anything beyond the demo.
 
+### OpenTelemetry → Cloud Trace (Stage 2c wiring for deploy)
+
+Spans are emitted through the opentelemetry SDK, so pointing them at GCP's
+Cloud Trace is additive — the Firestore exporter keeps working as-is and a
+second processor sends the same spans over OTLP:
+
+1. `uv add opentelemetry-exporter-otlp-proto-http`
+2. In `fleetops/otel.py:configure()`, alongside the existing
+   `SimpleSpanProcessor(FirestoreSpanExporter(db))`:
+
+   ```python
+   from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+   from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+   provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
+       endpoint=f"https://{PROJECT}-{REGION}.otlp.googleapis.com/v1/traces",
+       headers={"x-goog-api-key": os.environ["GCP_API_KEY"]},  # or a service account token
+   )))
+   ```
+
+3. Resource attributes are already set by the SDK provider: `service.name`
+   = `fleetops`, `service.version` — Cloud Trace groups traces by them. If you
+   prefer env-only config, `OTEL_SERVICE_NAME=fleetops` is honored upstream of
+   any custom resource.
+4. The span attribute contract travels with the spans (`incident_id`,
+   `agent`, task id, masked principal, `model` = active Gemini 3.x id on every
+   hop) — Cloud Trace's trace detail shows them per-span; filter traces by
+   `incident_id` to get the same chain the dashboard renders.
+5. Keep the model pin: deploy with `GEMINI_API_KEY` + `GEMINI_MODEL`
+   (3-series id). The traces will then show that exact id on every agent hop —
+   compliance evidence in the observability data itself.
+
 ## Project layout
 
 ```
@@ -218,7 +285,9 @@ fleetops/
   events.py    Pub/Sub contract + in-memory fake (durable queue, at-least-once)
   store.py     Firestore contract, doc shapes + in-memory fake
   gcp.py       Stage 3a: real Pub/Sub/Firestore clients behind the fake contracts
-  service.py   FastAPI control plane + background worker thread
+  otel.py      Stage 2c: OTel tracer provider + span exporter -> `traces` docs
+  dashboard.py Stage 2c: one-page observability dashboard (server-rendered HTML)
+  service.py   FastAPI control plane + background worker thread + /trace/{id}
   demo.py      `make demo` harness — registry, crash-resume, memory recall,
                HTTP surface; fails loudly
 ```
