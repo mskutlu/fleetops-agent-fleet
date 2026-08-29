@@ -24,8 +24,14 @@ DEFAULT_GEMINI_MODEL = "gemini-3-flash"
 
 
 def pinned_model() -> str:
-    """The explicit Gemini model id every ADK agent is created with."""
-    model = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    """The explicit Gemini model id every ADK agent is created with.
+
+    Unset GEMINI_MODEL -> the 3.x default pin. Set to empty/whitespace ->
+    raises, so nobody silently ships without an explicit model choice."""
+    raw = os.environ.get("GEMINI_MODEL")
+    if raw is None:
+        return DEFAULT_GEMINI_MODEL
+    model = raw.strip()
     if not model:
         raise ValueError(
             "GEMINI_MODEL is empty — pin an explicit 3.x model id "
