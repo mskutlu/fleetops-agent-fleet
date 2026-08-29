@@ -1,5 +1,11 @@
 """LLM layer: Gemini via ADK when GEMINI_API_KEY is set, else a deterministic
-MockLlm so `make demo` runs offline and stays reproducible."""
+MockLlm so `make demo` runs offline and stays reproducible.
+
+Model pin (hackathon mandatory stack — "Gemini 3.5 or newer"):
+    The model id is always explicit. `GEMINI_MODEL` overrides the default,
+    which is pinned at a 3-series id. ADK never falls back to its built-in
+    default silently: an empty override raises. If your key serves a different
+    3-series id, pin THAT via GEMINI_MODEL and note it in README/writeup."""
 
 from __future__ import annotations
 
@@ -13,10 +19,25 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
 
+# Default pin: a Gemini 3.x series id (hackathon mandatory stack).
+DEFAULT_GEMINI_MODEL = "gemini-3-flash"
+
+
+def pinned_model() -> str:
+    """The explicit Gemini model id every ADK agent is created with."""
+    model = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    if not model:
+        raise ValueError(
+            "GEMINI_MODEL is empty — pin an explicit 3.x model id "
+            f"(default: {DEFAULT_GEMINI_MODEL})"
+        )
+    return model
+
+
 def make_model(agent_name: str):
-    """Return a Gemini model id when a key exists, else the deterministic mock."""
+    """Return the pinned Gemini model id when a key exists, else the mock."""
     if os.environ.get("GEMINI_API_KEY"):
-        return "gemini-2.0-flash"
+        return pinned_model()
     return MockLlm(model="mock", agent_name=agent_name)
 
 

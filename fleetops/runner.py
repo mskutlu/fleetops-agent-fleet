@@ -1,8 +1,23 @@
-"""Orchestrates the incident flow: plan -> execute subtasks with specialists.
+"""Orchestrates the incident flow across an async pub/sub runtime.
 
-Every step is traced to the `traces` collection, prior context is pulled from
-the memory bank before specialists act, and task events are published to the
-`incidents` topic."""
+Request path (fast, no agent work): `create_incident` persists a session doc
+and publishes `incident.accepted`. That is all that runs inline.
+
+Worker path (off-request): a `Worker` drains the topic queue. An
+`incident.accepted` event triggers planning — the planner recalls prior fleet
+outcomes from the memory bank BEFORE acting and may only dispatch subtasks to
+registered+approved agents (registry gate; unresolvable kinds block the
+incident with a clear reason). Each subtask becomes a `task.created` job:
+resolve capability -> read specialist's memory notes -> run agent -> write the
+result back to memory + session doc (persisted before the task is marked done)
+-> publish `task.completed`. When every task is done, one consolidated outcome
+is written to fleet-level memory (the cross-session recall target), the
+session flips to `resolved`, and `incident.completed` is published.
+
+Crash-resume: job state lives in the Firestore session doc + the topic queue,
+never only in process memory. A crashed worker's unacked jobs stay on the
+topic; a fresh worker resumes from persisted state — done tasks are skipped
+(at-least-once), in-flight ones re-run."""
 
 from __future__ import annotations
 
@@ -17,9 +32,22 @@ from google.genai import types
 
 from .agents import build_agents
 from .events import InMemoryPubSub
-from .store import InMemoryFirestore, SessionDoc, TraceSpan
+from .memory import MemoryBank
+from .registry import Registry
+from .store import AgentCard, InMemoryFirestore, SessionDoc, TraceSpan
 
 TOPIC = "incidents"
+
+# subtask kind -> capability the serving agent must register + approved for
+CAPABILITY_FOR_KIND = {
+    "diagnose": "incident.diagnose",
+    "remediate": "incident.remediate",
+}
+
+
+class SimulatedCrash(RuntimeError):
+    """Worker died mid-run (process kill in production). Unacked jobs remain
+    on the topic queue; session state is persisted — a new worker resumes."""
 
 
 def _now() -> str:
@@ -42,14 +70,21 @@ class FleetOpsRunner:
         self.pubsub = pubsub or InMemoryPubSub()
         self.topic = self.pubsub.topic(TOPIC)
         self.planner, self.diagnoser, self.remediator, self.cards = build_agents()
+        # Stage 2a pillars: registry + memory bank (both backed by Firestore docs)
+        self.registry = Registry(self.db)
+        for card in self.cards:
+            self.registry.publish(card)
+        self.memory = MemoryBank(self.db)
         self._runners = {
             name: InMemoryRunner(agent=agent, app_name="fleetops")
             for name, agent in (("planner", self.planner), ("diagnoser", self.diagnoser), ("remediator", self.remediator))
         }
 
-    # -- public API ---------------------------------------------------------
+    # -- request path -------------------------------------------------------
 
     def create_incident(self, description: str, service: str) -> str:
+        """Accept an incident. Persists state + publishes the first job event;
+        NO agent work runs here — a Worker picks the job up from the queue."""
         incident_id = f"inc-{uuid.uuid4().hex[:8]}"
         doc = SessionDoc(
             incident_id=incident_id,
@@ -64,53 +99,135 @@ class FleetOpsRunner:
         self.topic.publish({"type": "incident.accepted", "incident_id": incident_id, "service": service})
         return incident_id
 
-    def run_incident_sync(self, incident_id: str) -> dict:
-        return asyncio.run(self.run_incident(incident_id))
+    # -- worker path --------------------------------------------------------
 
-    async def run_incident(self, incident_id: str) -> dict:
+    async def handle_msg(self, msg: dict) -> None:
+        data = msg["data"]
+        if data.get("type") == "incident.accepted":
+            await self._plan(data["incident_id"])
+        elif data.get("type") == "task.created":
+            await self._execute_task(data["incident_id"], data["task"]["id"])
+        # else: completion notifications (task.completed / incident.completed) —
+        # downstream signals; no state change here. Redeliveries are harmless.
+
+    def rejection_reason(self, capability: str) -> str:
+        """Clear gateway-style reason for a capability no approved agent serves."""
+        reason = f"no registered+approved agent serves capability '{capability}'"
+        cands = self.registry.candidates_for(capability)
+        if cands:
+            reason += f" (registered but unapproved: {', '.join(cands)})"
+        return reason
+
+    async def _plan(self, incident_id: str) -> None:
         ref = self.db.collection("sessions").document(incident_id)
         doc = ref.get().to_dict()
+        self._set_status(ref, "planning")
 
-        # 1. Plan
-        self._set_status(ref, doc, "planning")
-        plan_text = await self._run_agent("planner", f"{doc['description']} (Service: {doc['service']})")
-        plan = (_extract_json(plan_text) or {}).get("subtasks") or []
-        doc = ref.get().to_dict()
-        doc["plan"] = plan
-        ref.set(doc)
-        self.trace(incident_id, "planner", "planner_plan", {"plan": plan, "raw": plan_text})
-        for st in plan:
+        # Memory BEFORE acting: recall this service's prior fleet outcomes.
+        prior = self.memory.read("fleet", doc["service"])
+        context = f"Incident: {doc['description']} (Service: {doc['service']})"
+        if prior:
+            recalled = "\n".join(e["text"] for e in prior)
+            context += f"\nRecalled prior outcome from the fleet memory bank:\n{recalled}"
+        self.trace(incident_id, "planner", "memory_read", {"principal": f"fleet:{doc['service']}", "entries": prior})
+
+        plan_text = await self._run_agent("planner", context)
+        subtasks = (_extract_json(plan_text) or {}).get("subtasks") or []
+        if not subtasks:
+            self.trace(incident_id, "planner", "plan_empty", {"raw": plan_text})
+            self._set_status(ref, "blocked")
+            return
+
+        # Registry gate: planner may only dispatch to registered+approved agents.
+        for st in subtasks:
+            cap = CAPABILITY_FOR_KIND.get(st.get("kind"))
+            if self.registry.resolve(cap) is None:
+                reason = (f"capability '{cap}' not served by any registered+approved agent"
+                          + (f" (registered but unapproved: {', '.join(self.registry.candidates_for(cap))})"
+                             if cap and self.registry.candidates_for(cap) else ""))
+                self.trace(incident_id, "planner", "dispatch_rejected", {"kind": st.get("kind"), "capability": cap, "reason": reason})
+                self._set_status(ref, "blocked")
+                return
+
+        for st in subtasks:
+            st["status"] = "pending"
+        ref.set({**doc, "plan": subtasks})
+        self.trace(incident_id, "planner", "planner_plan", {"plan": subtasks, "raw": plan_text})
+        self._set_status(ref, "executing")
+        for st in subtasks:  # one job event per subtask — execution is off-request from here
             self.topic.publish({"type": "task.created", "incident_id": incident_id, "task": st})
 
-        # 2. Execute subtasks
-        for st in plan:
-            kind, service = st["kind"], st["service"]
-            agent_name = "diagnoser" if kind == "diagnose" else "remediator"
-            memory = self.db.collection("memory").document(service).get().to_dict()
-            self.trace(incident_id, agent_name, "memory_read", {"memory": memory or {}})
-            context = (
-                f"Subtask: {st['title']}\nKind: {kind}\nService: {service}\n"
-                f"Incident: {doc['description']}\n"
-                f"Memory context: {json.dumps(memory or {}, sort_keys=True)}"
-            )
-            result = await self._run_agent(agent_name, context)
-            self.trace(incident_id, agent_name, f"{agent_name}_result", {"result": result})
-            if kind == "diagnose":
-                self._remember(service, result)
-                doc = ref.get().to_dict()
-                doc["findings"].append(result)
-                ref.set(doc)
-            else:
-                doc = ref.get().to_dict()
-                doc["actions"].append(result)
-                ref.set(doc)
-            self.topic.publish({"type": "task.completed", "incident_id": incident_id, "task_id": st["id"], "agent": agent_name})
+    async def _execute_task(self, incident_id: str, task_id: str) -> None:
+        ref = self.db.collection("sessions").document(incident_id)
+        doc = ref.get().to_dict()
+        task = next((t for t in doc["plan"] if t["id"] == task_id), None)
+        if task is None:
+            self.trace(incident_id, "system", "task_unknown", {"task_id": task_id})
+            return
+        # Resume idempotency: redelivered jobs whose work already landed are skipped.
+        if task.get("status") == "done":
+            self.trace(incident_id, "system", "task_skipped_done", {"task_id": task_id})
+            return
 
-        # 3. Done
-        self._set_status(ref, ref.get().to_dict(), "resolved")
-        self.trace(incident_id, "system", "incident_resolved", {"subtasks": len(plan)})
-        self.topic.publish({"type": "incident.completed", "incident_id": incident_id})
-        return ref.get().to_dict()
+        kind = task["kind"]
+        agent_name = "diagnoser" if kind == "diagnose" else "remediator"
+        cap = CAPABILITY_FOR_KIND[kind]
+        # Re-check at dispatch time: the registry may have changed since planning.
+        card = self.registry.resolve(cap)
+        if card is None or card.name != agent_name:
+            reason = self.rejection_reason(cap)
+            self.trace(incident_id, agent_name, "dispatch_rejected", {"task_id": task_id, "capability": cap, "reason": reason})
+            self._set_status(ref, "blocked")
+            return
+
+        service = task.get("service") or doc["service"]
+        # Memory BEFORE acting: the specialist's own prior notes on this service.
+        notes = self.memory.read(agent_name, service)
+        context = (
+            f"Subtask: {task['title']}\nKind: {kind}\nService: {service}\n"
+            f"Incident: {doc['description']}"
+        )
+        if notes:
+            context += "\nRecalled prior context from the memory bank:\n" + json.dumps(notes, sort_keys=True)
+        self.trace(incident_id, agent_name, "memory_read", {"principal": f"{agent_name}:{service}", "entries": notes})
+
+        # Persist in-flight state BEFORE the (slow) agent run — crash evidence:
+        # if we die here, a resumed worker sees status=running and re-runs the job.
+        inflight = ref.get().to_dict()
+        for t in inflight["plan"]:
+            if t["id"] == task_id:
+                t["status"] = "running"
+        ref.set(inflight)
+
+        result = await self._run_agent(agent_name, context)
+
+        # Write back AFTER: memory bank + session doc, then mark done (atomic order).
+        ts = _now()
+        self.memory.write(agent_name, service, result, ts)
+        fresh = ref.get().to_dict()
+        if kind == "diagnose":
+            fresh["findings"] = (fresh.get("findings") or []) + [result]
+        else:
+            fresh["actions"] = (fresh.get("actions") or []) + [result]
+        for t in fresh["plan"]:
+            if t["id"] == task_id:
+                t["status"] = "done"
+        ref.set(fresh)
+        self.trace(incident_id, agent_name, f"{agent_name}_result", {"result": result})
+        self.topic.publish({"type": "task.completed", "incident_id": incident_id, "task_id": task_id, "agent": agent_name})
+
+        # Completion: all tasks done -> resolve + record the cross-session outcome.
+        fresh = ref.get().to_dict()
+        if fresh["plan"] and all(t.get("status") == "done" for t in fresh["plan"]):
+            outcome = (f"Incident {incident_id} on {fresh['service']} resolved: "
+                       f"findings={' | '.join(fresh.get('findings') or [])}; "
+                       f"actions={' | '.join(fresh.get('actions') or [])}")
+            self.memory.write("fleet", fresh["service"], outcome, _now())
+            self._set_status(ref, "resolved")
+            self.trace(incident_id, "system", "incident_resolved", {"subtasks": len(fresh["plan"])})
+            self.topic.publish({"type": "incident.completed", "incident_id": incident_id})
+
+    # -- shared surface -----------------------------------------------------
 
     def trace(self, incident_id: str, agent: str, step: str, detail: dict) -> None:
         span = TraceSpan(
@@ -123,8 +240,8 @@ class FleetOpsRunner:
         )
         self.db.collection("traces").add(span.to_doc())
 
-    def agent_cards(self) -> list[dict]:
-        return [c.__dict__ for c in self.cards]
+    def approved_agents(self) -> list[dict]:
+        return [c.__dict__ for c in self.registry.list_approved()]
 
     def get_traces(self, incident_id: str | None = None) -> list[dict]:
         spans = [s.to_dict() for s in self.db.collection("traces").stream()]
@@ -134,15 +251,9 @@ class FleetOpsRunner:
 
     # -- internals ----------------------------------------------------------
 
-    def _remember(self, service: str, findings: str) -> None:
-        ref = self.db.collection("memory").document(service)
-        existing = ref.get().to_dict() or {"findings": []}
-        existing["findings"] = (existing.get("findings") or [])[-4:] + [findings]
-        existing["updated_at"] = _now()
-        ref.set(existing)
-
     @staticmethod
-    def _set_status(ref, doc: dict, status: str) -> None:
+    def _set_status(ref, status: str) -> None:
+        doc = ref.get().to_dict()
         doc["status"] = status
         doc["updated_at"] = _now()
         ref.set(doc)
@@ -160,3 +271,27 @@ class FleetOpsRunner:
             if event.is_final_response and event.content and event.content.parts:
                 final = "".join(p.text or "" for p in event.content.parts if p.text)
         return final
+
+
+class Worker:
+    """Drains the incident topic until it is idle. `crash_after` simulates a
+    process kill after N handled jobs — unacked jobs stay on the topic and a
+    new Worker resumes from persisted state (see FleetOpsRunner.handle_msg)."""
+
+    def __init__(self, runner: FleetOpsRunner, crash_after: int | None = None):
+        self.runner = runner
+        self.crash_after = crash_after
+
+    def run(self) -> int:
+        jobs = 0
+        while True:
+            msg = self.runner.topic.pop(timeout=0.25)
+            if msg is None:
+                return jobs  # queue idle — nothing left to do
+            asyncio.run(self.runner.handle_msg(msg))
+            jobs += 1
+            if self.crash_after and jobs >= self.crash_after:
+                raise SimulatedCrash(
+                    f"worker died after {jobs} job(s); unacked on topic: "
+                    f"{self.runner.topic.pending_count}"
+                )

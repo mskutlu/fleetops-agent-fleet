@@ -1,11 +1,14 @@
 """Firestore contracts + local in-memory fake with the same read/write API.
 
 Doc shapes (collections):
-    agents   -> AgentCard   {name, role, description, model, tools, skills}
+    agents   -> AgentCard   {name, role, description, model, tools, skills,
+                             version, capabilities, owner_dept, approval_status}
     sessions -> SessionDoc  {incident_id, status, description, service,
                              plan, findings, actions, created_at, updated_at}
+                           (plan entries carry per-task status: pending|running|done)
     traces   -> TraceSpan   {id, incident_id, agent, step, detail, ts}
-    memory   -> dict        {service: {findings: [...], updated_at}} (memory bank)
+    memory   -> dict        doc id "principal:topic" ->
+                           {principal, topic, entries: [{ts, text}], updated_at} (memory bank)
 
 Contract (identical to `google.cloud.firestore`):
     db.collection(name)              -> CollectionReference
@@ -36,6 +39,11 @@ class AgentCard:
     model: str
     tools: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
+    # Stage 2a — registry fields (defaults keep Stage 1 cards valid):
+    version: str = "1.0.0"
+    capabilities: list[str] = field(default_factory=list)  # what the agent serves
+    owner_dept: str = ""
+    approval_status: str = "approved"  # approved | pending
 
 
 @dataclass

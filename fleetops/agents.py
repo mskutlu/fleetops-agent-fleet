@@ -3,9 +3,11 @@ subtasks with tools. Each agent is also exported as an AgentCard doc."""
 
 from __future__ import annotations
 
+import os
+
 from google.adk.agents import LlmAgent
 
-from .llm import make_model
+from .llm import make_model, pinned_model
 from .store import AgentCard
 from .tools import check_metrics, query_logs, restart_service, scale_service
 
@@ -26,6 +28,11 @@ _REMEDIATOR_INSTRUCTION = (
     "tools (restart_service, scale_service), respecting the memory context "
     "(findings from the diagnoser). Confirm the fix."
 )
+
+
+def model_label() -> str:
+    """What the agent cards report: the pinned 3.x id when keyed, else 'mock'."""
+    return pinned_model() if os.environ.get("GEMINI_API_KEY") else "mock"
 
 
 def build_agents():
@@ -54,25 +61,34 @@ def build_agents():
             name="planner",
             role="planner",
             description=planner.description,
-            model=str(planner.model),
+            model=model_label(),
             tools=[],
             skills=["incident_decomposition"],
+            version="2.0.0",
+            capabilities=["incident.plan"],
+            owner_dept="platform",
         ),
         AgentCard(
             name="diagnoser",
             role="specialist",
             description=diagnoser.description,
-            model=str(diagnoser.model),
+            model=model_label(),
             tools=["query_logs", "check_metrics"],
             skills=["root_cause_analysis"],
+            version="2.0.0",
+            capabilities=["incident.diagnose"],
+            owner_dept="sre-fleet",
         ),
         AgentCard(
             name="remediator",
             role="specialist",
             description=remediator.description,
-            model=str(remediator.model),
+            model=model_label(),
             tools=["restart_service", "scale_service"],
             skills=["automated_remediation"],
+            version="2.0.0",
+            capabilities=["incident.remediate"],
+            owner_dept="sre-fleet",
         ),
     ]
     return planner, diagnoser, remediator, cards
