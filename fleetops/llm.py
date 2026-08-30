@@ -19,8 +19,10 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
 
-# Default pin: a Gemini 3.x series id (hackathon mandatory stack).
-DEFAULT_GEMINI_MODEL = "gemini-3-flash"
+# Default pin: a Gemini 3.x series id (hackathon mandatory stack). The exact
+# `gemini-3-flash` id 404s for new API keys ("no longer available to new
+# users"); gemini-3.6-flash is the id the API itself recommends instead.
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 def pinned_model() -> str:
