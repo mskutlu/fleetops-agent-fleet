@@ -293,3 +293,11 @@ fleetops/
 ```
 
 No secrets are committed; synthetic incident data only.
+
+## CinemaOps — Devpost "Agentic Cinema" (ClickHouse track)
+
+A second entry built on the same ADK patterns: `cinema/` — a streaming-studio
+ops analyst that answers natural-language questions and runs anomaly digests
+against ClickHouse **through the official mcp-clickhouse MCP server** (stdio),
+with cross-session memory. `make cinema-up && make cinema-demo`. Details in
+[cinema/README.md](cinema/README.md).

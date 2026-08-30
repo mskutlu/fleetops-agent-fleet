@@ -11,6 +11,7 @@ dependencies = [
     # Stage 2c — OpenTelemetry-compliant trace emission (only new deps)
     "opentelemetry-api>=1.24",
     "opentelemetry-sdk>=1.24",
+    "mcp-clickhouse>=0.4",
 ]
 
 [project.optional-dependencies]
