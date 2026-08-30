@@ -1,0 +1,215 @@
+uv sync
+Using CPython 3.12.12
+Creating virtual environment at: .venv
+Resolved 68 packages in 560ms
+   Building fleetops @ file:///Users/msk/multica_workspaces/9d99ea68-39d4-4293-b17e-5d7d7c55bf8f/9abf6d13/workdir/fleetops-agent-fleet
+      Built fleetops @ file:///Users/msk/multica_workspaces/9d99ea68-39d4-4293-b17e-5d7d7c55bf8f/9abf6d13/workdir/fleetops-agent-fleet
+Prepared 1 package in 599ms
+Installed 57 packages in 118ms
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + aiosqlite==0.22.1
+ + annotated-doc==0.0.5
+ + annotated-types==0.8.0
+ + anyio==4.14.2
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + cryptography==50.0.1
+ + distro==1.9.0
+ + fastapi==0.141.1
+ + fleetops==0.1.0 (from file:///Users/msk/multica_workspaces/9d99ea68-39d4-4293-b17e-5d7d7c55bf8f/9abf6d13/workdir/fleetops-agent-fleet)
+ + frozenlist==1.8.0
+ + google-adk==2.8.0
+ + google-auth==2.57.0
+ + google-genai==2.20.0
+ + graphviz==0.21
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + idna==3.19
+ + joserfc==1.7.5
+ + jsonschema==4.26.0
+ + jsonschema-specifications==2025.9.1
+ + multidict==6.7.1
+ + opentelemetry-api==1.42.1
+ + opentelemetry-sdk==1.42.1
+ + opentelemetry-semantic-conventions==0.63b1
+ + packaging==26.3
+ + propcache==0.5.2
+ + pyasn1==0.6.4
+ + pyasn1-modules==0.4.2
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + requests==2.34.2
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + starlette==1.6.0
+ + tenacity==9.1.4
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzlocal==5.4.4
+ + urllib3==2.7.0
+ + uvicorn==0.52.4
+ + watchdog==6.0.0
+ + websockets==15.0.1
+ + yarl==1.24.5
+NO_SERVE=1 uv run python -u -m fleetops.demo
+== FleetOps Stage 2c demo — registry + runtime + memory + gateway/identity + armor + OTel traces & dashboard ==
+model pin: GEMINI_MODEL=gemini-3-flash (default gemini-3-flash) | active LLM: mock (offline, deterministic)
+
+================================================================
+[1. AGENT REGISTRY — publish / version / discover approved agents]
+================================================================
+/Users/msk/multica_workspaces/9d99ea68-39d4-4293-b17e-5d7d7c55bf8f/9abf6d13/workdir/fleetops-agent-fleet/.venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+  from starlette.testclient import TestClient as TestClient  # noqa
+GET /agents (approved only):
+  diagnoser  v2.0.0 caps=['incident.diagnose'] dept=sre-fleet
+  planner    v2.0.0 caps=['incident.plan'] dept=platform
+  remediator v2.0.0 caps=['incident.remediate'] dept=sre-fleet
+POST /agents billing-refunder -> 201 (submitted as pending)
+GET /agents still lists ['diagnoser', 'planner', 'remediator'] — pending card hidden from discovery ✓
+discovery GET /capabilities/incident.diagnose -> 200 served by diagnoser v2.0.0
+discovery GET /capabilities/billing.refund   -> 404 no registered+approved agent serves capability 'billing.refund' (registered but unapproved: billing-refunder)
+
+================================================================
+[2. ASYNC RUNTIME — incident A off the request path; kill-and-resume]
+================================================================
+POST /incidents -> 202 accepted inc-1c0f0e68 (request path returned before any agent work)
+Skipping missing token usage metadata for agent planner and model mock
+/Users/msk/multica_workspaces/9d99ea68-39d4-4293-b17e-5d7d7c55bf8f/9abf6d13/workdir/fleetops-agent-fleet/.venv/lib/python3.12/site-packages/google/adk/models/llm_request.py:298: UserWarning: [EXPERIMENTAL] feature FeatureName.JSON_SCHEMA_FOR_FUNC_DECL is enabled.
+  declaration = tool._get_declaration()
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+
+*** SIMULATED CRASH — worker died after 2 job(s); unacked on topic: 2
+persisted state at crash (Firestore session doc): status=executing tasks={'t1': 'done', 't2': 'pending'} findings=1
+
+*** RESTART — new worker resumes from persisted state
+Skipping missing token usage metadata for agent remediator and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+after resume: status=resolved tasks={'t1': 'done', 't2': 'done'} findings=1 actions=1
+
+--- reasoning chain ---
+[    system] incident_accepted  {"description": "payment-service returns 500s and high latency since the 14:00 deploy; upstream calls to payments-db are timing out", "service": "payment-service"}
+[   gateway] gateway_route      {"action": "dispatch", "capability": "incident.plan", "decision": "allow", "principal": "svc-orchestrator", "role": "planner", "target": "planner", "token": "tok-orchestr\u2026"}
+[   planner] memory_read        {"entries": [], "principal": "fleet:payment-service"}
+[   planner] planner_plan       {"plan": [{"id": "t1", "kind": "diagnose", "service": "payment-service", "status": "pending", "title": "Diagnose payment-service incident"}, {"id": "t2", "kind": "remediate", "service": "payment-service", "status": "pend
+[   gateway] gateway_route      {"action": "execute", "capability": "incident.diagnose", "decision": "allow", "principal": "svc-diagnoser", "role": "specialist", "target": "diagnoser", "token": "tok-diagnose\u2026"}
+[ diagnoser] memory_read        {"entries": [], "principal": "diagnoser:payment-service"}
+[ diagnoser] tool_call          {"args": {"minutes": 15, "service": "payment-service"}, "principal": "diagnoser", "status": "ok", "tool": "query_logs"}
+[ diagnoser] tool_call          {"args": {"service": "payment-service"}, "principal": "diagnoser", "status": "ok", "tool": "check_metrics"}
+[ diagnoser] memory_write       {"entry": "Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.", "principal": "diagnoser:payment-service"}
+[ diagnoser] diagnoser_result   {"result": "Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.", "task_id": "t1"}
+[   gateway] gateway_route      {"action": "execute", "capability": "incident.remediate", "decision": "allow", "principal": "svc-remediator", "role": "specialist", "target": "remediator", "token": "tok-remediat\u2026"}
+[remediator] memory_read        {"entries": [], "principal": "remediator:payment-service"}
+[remediator] tool_call          {"args": {"service": "payment-service"}, "principal": "remediator", "status": "ok", "tool": "restart_service"}
+[remediator] memory_write       {"entry": "Remediation applied to payment-service using recorded findings; health checks pass.", "principal": "remediator:payment-service"}
+[remediator] remediator_result  {"result": "Remediation applied to payment-service using recorded findings; health checks pass.", "task_id": "t2"}
+[    system] memory_write       {"entry": "Incident inc-1c0f0e68 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remediation applied
+[    system] incident_resolved  {"subtasks": 2}
+
+================================================================
+[3. MEMORY BANK — incident B recalls A's outcome before acting]
+================================================================
+[memory] planner context BEFORE planning (recalled from the memory bank):
+  fleet:payment-service <- Incident inc-1c0f0e68 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remediation applied to payment-service using recorded findings; health checks pass.
+Skipping missing token usage metadata for agent planner and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+
+[memory] principals that recalled prior context BEFORE acting: ['diagnoser:payment-service', 'fleet:payment-service', 'remediator:payment-service']
+  planner <- Incident inc-1c0f0e68 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated e...
+  diagnoser <- Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded....
+  remediator <- Remediation applied to payment-service using recorded findings; health checks pass....
+
+[memory bank] fleet-level outcomes for payment-service (cross-session):
+  2026-08-30T16:15:25Z  Incident inc-1c0f0e68 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remediation applied to payment-service using recorded findings; health checks pass.
+  2026-08-30T16:15:25Z  Incident inc-acfa3130 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remediation applied to payment-service using recorded findings; health checks pass.
+
+--- reasoning chain ---
+[    system] incident_accepted  {"description": "latency recurred on payment-service after last night's scale-up; need the same incident handled again", "service": "payment-service"}
+[   gateway] gateway_route      {"action": "dispatch", "capability": "incident.plan", "decision": "allow", "principal": "svc-orchestrator", "role": "planner", "target": "planner", "token": "tok-orchestr\u2026"}
+[   planner] memory_read        {"entries": [{"text": "Incident inc-1c0f0e68 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remedia
+[   planner] planner_plan       {"plan": [{"id": "t1", "kind": "diagnose", "service": "payment-service", "status": "pending", "title": "Diagnose payment-service incident"}, {"id": "t2", "kind": "remediate", "service": "payment-service", "status": "pend
+[   gateway] gateway_route      {"action": "execute", "capability": "incident.diagnose", "decision": "allow", "principal": "svc-diagnoser", "role": "specialist", "target": "diagnoser", "token": "tok-diagnose\u2026"}
+[ diagnoser] memory_read        {"entries": [{"text": "Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.", "ts": "2026-08-30T16:15:25.354002+00:00"}], "principal": "diagnoser:paymen
+[ diagnoser] tool_call          {"args": {"minutes": 15, "service": "payment-service"}, "principal": "diagnoser", "status": "ok", "tool": "query_logs"}
+[ diagnoser] tool_call          {"args": {"service": "payment-service"}, "principal": "diagnoser", "status": "ok", "tool": "check_metrics"}
+[ diagnoser] memory_write       {"entry": "Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.", "principal": "diagnoser:payment-service"}
+[ diagnoser] diagnoser_result   {"result": "Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.", "task_id": "t1"}
+[   gateway] gateway_route      {"action": "execute", "capability": "incident.remediate", "decision": "allow", "principal": "svc-remediator", "role": "specialist", "target": "remediator", "token": "tok-remediat\u2026"}
+[remediator] memory_read        {"entries": [{"text": "Remediation applied to payment-service using recorded findings; health checks pass.", "ts": "2026-08-30T16:15:25.358258+00:00"}], "principal": "remediator:payment-service"}
+[remediator] tool_call          {"args": {"replicas": 4, "service": "payment-service"}, "principal": "remediator", "status": "ok", "tool": "scale_service"}
+[remediator] memory_write       {"entry": "Remediation applied to payment-service using recorded findings; health checks pass.", "principal": "remediator:payment-service"}
+[remediator] remediator_result  {"result": "Remediation applied to payment-service using recorded findings; health checks pass.", "task_id": "t2"}
+[    system] memory_write       {"entry": "Incident inc-acfa3130 on payment-service resolved: findings=Diagnosis complete for payment-service: logs show repeated errors and metrics confirm the regression. Findings recorded.; actions=Remediation applied
+[    system] incident_resolved  {"subtasks": 2}
+
+================================================================
+[4. HTTP SURFACE — end-to-end sanity (incident C via API)]
+================================================================
+Skipping missing token usage metadata for agent planner and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+POST /incidents      -> 202 inc-5ca43177 (dispatch scope ok; routed_to=planner)
+GET /incidents/{id} -> status=resolved plan=2 subtasks
+GET /agents          -> 3 approved cards (pending still hidden)
+GET /traces          -> 17 spans for inc-5ca43177
+
+================================================================
+[5. GATEWAY + IDENTITY — zero-trust routing, policy denials]
+================================================================
+valid principal      -> 202 inc-1cacee95
+  gateway span: svc-orchestrator (planner) dispatch incident.plan -> planner [allow]
+Skipping missing token usage metadata for agent planner and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent diagnoser and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+Skipping missing token usage metadata for agent remediator and model mock
+agent-to-agent hops  -> every hop authenticated: {'svc-orchestrator': 'planner', 'svc-diagnoser': 'diagnoser', 'svc-remediator': 'remediator'}
+unknown principal    -> 401 unknown principal token tok-ghost-00…
+  traced: deny (tok-ghost-00…)
+out-of-scope action  -> 403 principal 'svc-diagnoser' (specialist) may not publish (scopes: execute)
+  traced: deny for 'publish'
+
+================================================================
+[6. MODEL ARMOR — pre-tool-call guardrail, live block]
+================================================================
+tool call with injection+PII args -> BLOCKED before reaching restart_service
+  reason: prompt-injection: instruction override
+  reason: prompt-injection: data exfiltration
+  reason: pii: email address
+  traced: remediator/guardrail_blocked on inc-1cacee95; tool returned {"status": "blocked", "tool": "restart_service", "reasons": ["prompt-injection: instruction override", "prompt-injection: data exfiltration", "pii: email address"]}
+
+================================================================
+[7. OBSERVABILITY — OTel span chain + one-page dashboard]
+================================================================
+Skipping missing token usage metadata for agent planner and model mock
+in-incident rejection   -> incident inc-ae70b069 status=blocked
+  reason: capability 'incident.diagnose' not served by any registered+approved agent (registered but unapproved: diagnoser)
+guardrail block         -> BLOCKED on the same incident: ['prompt-injection: instruction override', 'prompt-injection: data exfiltration']…
+span model pin          -> every one of the 5 spans carries model=mock (mandatory-stack compliance visible in traces)
+dashboard               -> GET /trace/inc-ae70b069 : 5 spans rendered, 2 red-highlighted (rejection + guardrail block)
+
+Dashboard URL: http://127.0.0.1:8080/trace/inc-ae70b069
+
+DEMO PASSED — registry ✓ crash-resume ✓ memory bank ✓ async runtime ✓ gateway+identity ✓ model armor ✓ OTel traces + dashboard ✓
+(NO_SERVE=1 — exiting; open http://127.0.0.1:8080/trace/inc-ae70b069 with `make run`)
