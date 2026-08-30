@@ -13,6 +13,10 @@ local and fully offline-capable; deployment lands in Stage 3.
 
 ## Architecture
 
+![Architecture diagram](docs/architecture.png)
+
+*Diagram source: [`docs/architecture.svg`](docs/architecture.svg). Demo video: [`docs/demo_video.mp4`](docs/demo_video.mp4) (3:55, captions, real runs). Devpost submission text: [`submission/devpost_submission.md`](submission/devpost_submission.md).*
+
 The control plane is a FastAPI service backed by three ADK agents and two GCP
 service fakes with production-identical contracts.
 
