@@ -89,7 +89,9 @@ Firestore registry (`GET /agents`, approved-only).
 
 **Model pin (mandatory stack).** Every agent is created with an explicit
 3-series Gemini id — never a silent ADK default. `GEMINI_MODEL` overrides the
-default, which is pinned at `gemini-3-flash`; if your key serves a different
+default, which is pinned at `gemini-3.6-flash` (the exact `gemini-3-flash` id
+is retired for new API keys; 2.5 ids are deprecated for new users); if your
+key serves a different
 3-series id, pin THAT via `GEMINI_MODEL` and note it here/in the writeup so a
 judge can verify compliance at deploy time (an empty override raises rather
 than falling back). Without an API key a deterministic `MockLlm` (an ADK
@@ -140,7 +142,7 @@ With Gemini (optional):
 ```bash
 export GEMINI_API_KEY=...   # https://aistudio.google.com/apikey
 # optional: override the pinned 3.x model id if your key serves a different one
-export GEMINI_MODEL=gemini-3-flash
+export GEMINI_MODEL=gemini-3.6-flash
 make demo
 ```
 
@@ -180,6 +182,11 @@ publishing with them returns 403).
 
 ## Deploy to Google Cloud Run (Stage 3a)
 
+**Currently live** (project `feetops-devpos`, deployed 2026-08-30):
+`https://fleetops-qiedvqu63a-ew.a.run.app` — running on the deterministic
+MockLlm (`GEMINI_API_KEY` not yet attached; adding it later is one
+`gcloud run services update fleetops --region europe-west1 --update-env-vars GEMINI_API_KEY=...` away).
+
 One command, idempotent — provisions everything and deploys:
 
 ```bash
@@ -199,7 +206,7 @@ gcloud pubsub subscriptions create fleetops-incidents-worker --topic=fleetops-in
 gcloud firestore databases create --location=europe-west1          # skip if the project already has one
 gcloud run deploy fleetops --source . --region europe-west1 \
   --allow-unauthenticated --no-cpu-throttling --max-instances 1 \
-  --set-env-vars "FLEETOPS_BACKEND=gcp,GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT,PUBSUB_TOPIC=fleetops-incidents,GEMINI_MODEL=gemini-3-flash,GEMINI_API_KEY=$GEMINI_API_KEY"
+  --set-env-vars "FLEETOPS_BACKEND=gcp,GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT,PUBSUB_TOPIC=fleetops-incidents,GEMINI_MODEL=gemini-3.6-flash,GEMINI_API_KEY=$GEMINI_API_KEY"
 gcloud run services describe fleetops --region europe-west1 --format 'value(status.url)'
 ```
 
@@ -217,10 +224,12 @@ interfaces of the local fakes — no other code changes. Locally (default
 offline. The gateway seeds its synthetic demo principals into the Firestore
 `principals` collection on first boot.
 
-**Verify the live URL** (`$URL` from the deploy output):
+**Verify the live URL** (`$URL` from the deploy output; note `/healthz` is
+reserved by Google's edge on `*.run.app` and 404s before reaching the service —
+smoke-check `/agents` instead):
 
 ```bash
-curl -s $URL/healthz
+curl -s $URL/agents
 ID=$(curl -s -X POST $URL/incidents -H 'content-type: application/json' \
   -H 'Authorization: Bearer tok-orchestrator-a1b2' \
   -d '{"description": "payment-service 500s and timeouts since 14:00 deploy", "service": "payment-service"}' | jq -r .id)

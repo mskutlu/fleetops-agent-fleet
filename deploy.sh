@@ -9,6 +9,8 @@
 set -euo pipefail
 
 : "${GOOGLE_CLOUD_PROJECT:?export GOOGLE_CLOUD_PROJECT=<project-id> first (gcloud auth login if needed)}"
+# gcloud CLI reads the project from CLOUDSDK_CORE_PROJECT / config, not GOOGLE_CLOUD_PROJECT
+export CLOUDSDK_CORE_PROJECT="${CLOUDSDK_CORE_PROJECT:-$GOOGLE_CLOUD_PROJECT}"
 REGION="${REGION:-europe-west1}"
 SVC="fleetops"
 TOPIC="fleetops-incidents"
@@ -25,7 +27,7 @@ echo "== Firestore (native, $REGION) =="
 gcloud firestore databases create --location="$REGION" 2>/dev/null || echo "firestore database exists"
 
 echo "== Env =="
-ENVARS="FLEETOPS_BACKEND=gcp,GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},PUBSUB_TOPIC=${TOPIC},GEMINI_MODEL=${GEMINI_MODEL:-gemini-3-flash}"
+ENVARS="FLEETOPS_BACKEND=gcp,GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT},PUBSUB_TOPIC=${TOPIC},GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.6-flash}"
 if [[ -n "${GEMINI_API_KEY:-}" ]]; then
   ENVARS+=",GEMINI_API_KEY=${GEMINI_API_KEY}"   # demo path; move to Secret Manager for anything longer-lived
 else
@@ -44,4 +46,5 @@ gcloud run deploy "$SVC" \
 URL="$(gcloud run services describe "$SVC" --region "$REGION" --format 'value(status.url)')"
 echo
 echo "LIVE URL: $URL"
-echo "Smoke: curl -s $URL/healthz"
+# NOTE: not /healthz — Google's edge reserves that path on *.run.app and 404s it client-side
+echo "Smoke: curl -s $URL/agents"
