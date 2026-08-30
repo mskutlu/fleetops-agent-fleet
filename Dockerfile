@@ -17,7 +17,7 @@ ENV PATH=/opt/venv/bin:$PATH \
     PORT=8080
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends software-properties-common ca-certificates \
+ && apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg \
  && add-apt-repository -y ppa:deadsnakes/ppa \
  && apt-get update \
  && apt-get install -y --no-install-recommends python3.11 python3.11-venv \
